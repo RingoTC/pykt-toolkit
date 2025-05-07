@@ -162,15 +162,15 @@ class Architecture(nn.Module):
 
         # encoder
         for block in self.blocks_1:  # encode qas, 对0～t-1时刻前的qa信息进行编码
-            y = block(mask=1, query=y, key=y, values=y, pdiff=pid_embed_data) # yt^
+            y = block(mask=1, query=y, key=y, values=y, q4router=x, zero_pad=True) # yt^
         flag_first = True
         for block in self.blocks_2:
             if flag_first:  # peek current question
                 x = block(mask=1, query=x, key=x,
-                          values=x, apply_pos=False, pdiff=pid_embed_data) # False: 没有FFN, 第一层只有self attention, 对应于xt^
+                          values=x, apply_pos=False, q4router=x, zero_pad=True) # False: 没有FFN, 第一层只有self attention, 对应于xt^
                 flag_first = False
             else:  # dont peek current response
-                x = block(mask=0, query=x, key=x, values=y, apply_pos=True, pdiff=pid_embed_data) # True: +FFN+残差+laynorm 非第一层与0~t-1的的q的attention, 对应图中Knowledge Retriever
+                x = block(mask=0, query=x, key=x, values=y, apply_pos=True, q4router=x, zero_pad=True) # True: +FFN+残差+laynorm 非第一层与0~t-1的的q的attention, 对应图中Knowledge Retriever
                 # mask=0，不能看到当前的response, 在Knowledge Retrever的value全为0，因此，实现了第一题只有question信息，无qa信息的目的
                 # print(x[0,0,:])
                 flag_first = True
@@ -208,7 +208,7 @@ class TransformerLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(d_model)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, mask, query, key, values, apply_pos=True, pdiff=None):
+    def forward(self, mask, query, key, values, apply_pos=True, q4router=None, zero_pad=True):
         """
         Input:
             block : object of type BasicBlock(nn.Module). It contains masked_attn_head objects which is of type MultiHeadAttention(nn.Module).
@@ -229,11 +229,11 @@ class TransformerLayer(nn.Module):
         if mask == 0:  # If 0, zero-padding is needed.
             # Calls block.masked_attn_head.forward() method
             query2 = self.masked_attn_head(
-                query, key, values, mask=src_mask, zero_pad=True, pdiff=pdiff) # 只能看到之前的信息，当前的信息也看不到，此时会把第一行score全置0，表示第一道题看不到历史的interaction信息，第一题attn之后，对应value全0
+                query, key, values, mask=src_mask, zero_pad=True, q4router=q4router) # 只能看到之前的信息，当前的信息也看不到，此时会把第一行score全置0，表示第一道题看不到历史的interaction信息，第一题attn之后，对应value全0
         else:
             # Calls block.masked_attn_head.forward() method
             query2 = self.masked_attn_head(
-                query, key, values, mask=src_mask, zero_pad=False, pdiff=pdiff)
+                query, key, values, mask=src_mask, zero_pad=False, q4router=q4router)
 
         query = query + self.dropout1((query2)) # 残差1
         query = self.layer_norm1(query) # layer norm
@@ -244,11 +244,9 @@ class TransformerLayer(nn.Module):
             query = self.layer_norm2(query) # lay norm
         return query
 
-
 class MoHAttention(nn.Module):
     def __init__(self, d_model, d_feature, n_heads, n_shared_heads, 
-                 n_selected_heads, dropout, kq_same,
-                 seq_len=200, routing_mode="dynamic"):
+                 n_selected_heads, dropout, kq_same):
         super().__init__()
         self.d_model = d_model
         self.d_k = d_feature
@@ -256,7 +254,6 @@ class MoHAttention(nn.Module):
         self.h_shared = n_shared_heads
         self.h_selected = n_selected_heads
         self.kq_same = kq_same
-        self.routing_mode = routing_mode
         
         # Linear layers for Q, K, V
         self.q_linear = nn.Linear(d_model, d_model)
@@ -264,9 +261,8 @@ class MoHAttention(nn.Module):
             self.k_linear = nn.Linear(d_model, d_model)
         self.v_linear = nn.Linear(d_model, d_model)
         
-        # Routing networks
-        if routing_mode == "dynamic":
-            self.wg = nn.Linear(d_model, n_heads - n_shared_heads, bias=False)  # Router for dynamic heads
+        # Router for dynamic heads
+        self.wg = nn.Linear(d_model, n_heads - n_shared_heads, bias=False)
             
         self.dropout = nn.Dropout(dropout)
         self.out = nn.Linear(d_model, d_model)
@@ -282,7 +278,7 @@ class MoHAttention(nn.Module):
         balance_loss = (f * P).sum()
         return balance_loss
         
-    def forward(self, q, k, v, mask=None, zero_pad=False, pdiff=None):
+    def forward(self, q, k, v, mask, zero_pad, q4router):
         bs = q.size(0)
         seq_len = q.size(1)
         
@@ -299,38 +295,15 @@ class MoHAttention(nn.Module):
         k = k.view(bs, -1, self.h, self.d_k).transpose(1, 2)
         v = v.view(bs, -1, self.h, self.d_k).transpose(1, 2)
         
-        # Calculate attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.d_k ** 0.5)  # [bs, h, seq_len, seq_len]
-        
-            
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-            
-        # First position zero padding
-        if zero_pad:
-            pad_zero = torch.zeros(bs, self.h, 1, scores.size(-1)).to(q.device)
-            scores = torch.cat([pad_zero, scores[:, :, 1:, :]], dim=2)
-        
-        # Calculate routing scores for dynamic heads
-        q_for_routing = q.permute(0, 2, 1, 3).reshape(bs * seq_len, self.h * self.d_k)  # [bs*seq_len, h*d_k]
-        
-        # Handle dynamic heads routing
-        if self.routing_mode == "dynamic":
-            # Use learned routing weights
-            logits = self.wg(q_for_routing)  # [bs*seq_len, n_dynamic_heads]
-            gates = F.softmax(logits, dim=1)  # [bs*seq_len, n_dynamic_heads]
-        else:  # query_norm mode
-            # Calculate L2 norms for dynamic heads
-            q_for_routing = q.permute(0, 2, 1, 3).reshape(-1, self.h, self.d_k)
-            logits = torch.stack([
-                torch.norm(q_for_routing[:, i, :], p=2, dim=1) 
-                for i in range(self.h_shared, self.h)
-            ], dim=1)  # [bs*seq_len, n_dynamic_heads]
-            
-            # Normalize logits
-            logits_std = logits.std(dim=1, keepdim=True)
-            logits_norm = logits / (logits_std / 1)
-            gates = F.softmax(logits_norm, dim=1)  # [bs*seq_len, n_dynamic_heads]
+        # Reshape q4router to match expected dimensions
+        # Always use the question information for routing
+        q_for_routing = q4router.view(bs, seq_len, self.h, self.d_k)  # [bs, seq_len, h, d_k]
+        q_for_routing = q_for_routing.permute(0, 2, 1, 3)  # [bs, h, seq_len, d_k]
+        q_for_routing = q_for_routing.reshape(bs * seq_len, self.h * self.d_k)
+
+        # Use learned routing weights
+        logits = self.wg(q_for_routing)  # [bs*seq_len, n_dynamic_heads]
+        gates = F.softmax(logits, dim=1)  # [bs*seq_len, n_dynamic_heads]
         
         # Select top-k heads
         _, indices = torch.topk(gates, k=self.h_selected, dim=1)
@@ -354,18 +327,32 @@ class MoHAttention(nn.Module):
         # Reshape routing mask to match attention dimensions [bs, h, seq_len, 1]
         routing_mask = routing_mask.mean(dim=1).unsqueeze(-1).unsqueeze(-1)
         
-        # Apply attention
-        attn = self.dropout(torch.softmax(scores, dim=-1))
-        
-        # Save attention maps for visualization
-        self.attention_maps = attn.detach().clone()  # [bs, h, seq_len, seq_len]
-        
-        context = torch.matmul(attn, v)  # [bs, h, seq_len, d_k]
+        # Calculate attention scores and apply routing
+        scores = attention(q, k, v, self.d_k, mask, self.dropout, zero_pad)
         
         # Apply routing mask
-        context = context * routing_mask
+        output = scores * routing_mask
         
         # Combine heads
-        context = context.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
+        output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
         
-        return self.out(context)
+        return self.out(output)
+
+def attention(q, k, v, d_k, mask, dropout, zero_pad):
+    """
+    每个头的 Attention 计算，也就是标准的 scale-dot attention
+    """
+    # d_k: 每一个头的dim
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)  # BS, 8, seqlen, seqlen
+    bs, head, seqlen = scores.size(0), scores.size(1), scores.size(2)
+
+    scores.masked_fill_(mask == 0, -1e32)
+    scores = F.softmax(scores, dim=-1)  # BS,8,seqlen,seqlen
+    
+    if zero_pad:
+        pad_zero = torch.zeros(bs, head, 1, seqlen).to(device)
+        scores = torch.cat([pad_zero, scores[:, :, 1:, :]], dim=2) # 第一行score置0
+    
+    scores = dropout(scores)
+    output = torch.matmul(scores, v)
+    return output
