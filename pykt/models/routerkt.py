@@ -325,7 +325,9 @@ class MoHAttention(nn.Module):
         routing_mask[:, :, self.h_shared:] = dynamic_scores_reshaped  # Add dynamic head weights
         
         # Reshape routing mask to match attention dimensions [bs, h, seq_len, 1]
-        routing_mask = routing_mask.mean(dim=1).unsqueeze(-1).unsqueeze(-1)
+        # routing_mask = routing_mask.mean(dim=1).unsqueeze(-1).unsqueeze(-1)
+
+        routing_mask = routing_mask.permute(0, 2, 1).unsqueeze(-1)
         
         # Calculate attention scores and apply routing
         scores = attention(q, k, v, self.d_k, mask, self.dropout, zero_pad)

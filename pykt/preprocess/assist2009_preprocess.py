@@ -2,6 +2,7 @@
 
 import pandas as pd
 from .utils import sta_infos, write_txt, format_list2str
+import random
 
 KEYS = ["user_id", "skill_id", "problem_id"]
 
@@ -29,6 +30,8 @@ def read_data_from_csv(read_file, write_file):
         seq_problems = tmp_inter['problem_id'].tolist()
         seq_skills = tmp_inter['skill_id'].tolist()
         seq_ans = tmp_inter['correct'].tolist()
+        # random seq_ans
+        # seq_ans = [random.choice([0, 1]) for _ in range(seq_len)]
         seq_start_time = ['NA']
         seq_response_cost = ['NA']
 
@@ -36,8 +39,24 @@ def read_data_from_csv(read_file, write_file):
 
         user_inters.append(
             [[str(user), str(seq_len)], format_list2str(seq_problems), format_list2str(seq_skills), format_list2str(seq_ans), seq_start_time, seq_response_cost])
+        
 
     write_txt(write_file, user_inters)
+
+    # Count the ratio of 0s and 1s in all seq_ans
+    total_answers = []
+    for user_inter in user_inters:
+        answers = user_inter[3]  # user_inter[3] is already a list
+        total_answers.extend(answers)
+    
+    total_count = len(total_answers)
+    count_0 = total_answers.count('0')
+    count_1 = total_answers.count('1')
+    
+    print(f"\nRandom answer distribution:")
+    print(f"Total answers: {total_count}")
+    print(f"0s: {count_0} ({count_0/total_count*100:.2f}%)")
+    print(f"1s: {count_1} ({count_1/total_count*100:.2f}%)")
 
     print("\n".join(stares))
 
