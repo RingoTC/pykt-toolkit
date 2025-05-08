@@ -146,7 +146,7 @@ class Architecture(nn.Module):
             self.blocks_2 = nn.ModuleList([
                 TransformerLayer(d_model=d_model, d_feature=d_model // n_heads,
                                  d_ff=d_ff, dropout=dropout, n_heads=n_heads, kq_same=kq_same, emb_type=emb_type)
-                for _ in range(n_blocks*2)
+                for _ in range(n_blocks)
             ])
 
     def forward(self, q_embed_data, qa_embed_data, pid_embed_data):
@@ -161,19 +161,25 @@ class Architecture(nn.Module):
         x = q_pos_embed
 
         # encoder
-        for block in self.blocks_1:  # encode qas, 对0～t-1时刻前的qa信息进行编码
-            y = block(mask=1, query=y, key=y, values=y, q4router=x, zero_pad=True) # yt^
-        flag_first = True
+        # for block in self.blocks_1:  # encode qas, 对0～t-1时刻前的qa信息进行编码
+        #     y = block(mask=1, query=y, key=y, values=y, q4router=x, zero_pad=True) # yt^
+        # flag_first = True
+        # for block in self.blocks_2:
+        #     if flag_first:  # peek current question
+        #         x = block(mask=1, query=x, key=x,
+        #                   values=x, apply_pos=False, q4router=x, zero_pad=True) # False: 没有FFN, 第一层只有self attention, 对应于xt^
+        #         flag_first = False
+        #     else:  # dont peek current response
+        #         x = block(mask=0, query=x, key=x, values=y, apply_pos=True, q4router=x, zero_pad=True) # True: +FFN+残差+laynorm 非第一层与0~t-1的的q的attention, 对应图中Knowledge Retriever
+        #         # mask=0，不能看到当前的response, 在Knowledge Retrever的value全为0，因此，实现了第一题只有question信息，无qa信息的目的
+        #         # print(x[0,0,:])
+        #         flag_first = True
+        # return x
+        
         for block in self.blocks_2:
-            if flag_first:  # peek current question
-                x = block(mask=1, query=x, key=x,
-                          values=x, apply_pos=False, q4router=x, zero_pad=True) # False: 没有FFN, 第一层只有self attention, 对应于xt^
-                flag_first = False
-            else:  # dont peek current response
-                x = block(mask=0, query=x, key=x, values=y, apply_pos=True, q4router=x, zero_pad=True) # True: +FFN+残差+laynorm 非第一层与0~t-1的的q的attention, 对应图中Knowledge Retriever
-                # mask=0，不能看到当前的response, 在Knowledge Retrever的value全为0，因此，实现了第一题只有question信息，无qa信息的目的
-                # print(x[0,0,:])
-                flag_first = True
+            x = block(mask=0, query=x, key=x, values=y, apply_pos=True, q4router=x, zero_pad=True) # True: +FFN+残差+laynorm 非第一层与0~t-1的的q的attention, 对应图中Knowledge Retriever
+            # mask=0，不能看到当前的response, 在Knowledge Retrever的value全为0，因此，实现了第一题只有question信息，无qa信息的目的
+            # print(x[0,0,:])
         return x
 
     def get_balance_loss(self):
@@ -194,7 +200,7 @@ class TransformerLayer(nn.Module):
         kq_same = kq_same == 1
         # Multi-Head Attention Block
         self.masked_attn_head = MoHAttention(
-            d_model, d_feature, n_heads, n_shared_heads=1, n_selected_heads=2, dropout=dropout, kq_same=kq_same)
+            d_model, d_feature, n_heads, n_shared_heads=0, n_selected_heads=2, dropout=dropout, kq_same=kq_same)
 
         # Two layer norm layer and two droput layer
         self.layer_norm1 = nn.LayerNorm(d_model)
@@ -251,7 +257,6 @@ class MoHAttention(nn.Module):
         self.d_model = d_model
         self.d_k = d_feature
         self.h = n_heads
-        self.h_shared = n_shared_heads
         self.h_selected = n_selected_heads
         self.kq_same = kq_same
         
@@ -262,14 +267,14 @@ class MoHAttention(nn.Module):
         self.v_linear = nn.Linear(d_model, d_model)
         
         # Router for dynamic heads
-        self.wg = nn.Linear(d_model, n_heads - n_shared_heads, bias=False)
-            
+        self.wg = nn.Linear(d_model, n_heads, bias=False)
+        
         self.dropout = nn.Dropout(dropout)
         self.out = nn.Linear(d_model, d_model)
         
         # Track routing statistics for load balancing
-        self.register_buffer('head_selections', torch.zeros(n_heads - n_shared_heads))
-        self.register_buffer('head_routing_probs', torch.zeros(n_heads - n_shared_heads))
+        self.register_buffer('head_selections', torch.zeros(n_heads))
+        self.register_buffer('head_routing_probs', torch.zeros(n_heads))
         
     def get_balance_loss(self):
         # Calculate load balance loss for dynamic heads
@@ -296,14 +301,13 @@ class MoHAttention(nn.Module):
         v = v.view(bs, -1, self.h, self.d_k).transpose(1, 2)
         
         # Reshape q4router to match expected dimensions
-        # Always use the question information for routing
         q_for_routing = q4router.view(bs, seq_len, self.h, self.d_k)  # [bs, seq_len, h, d_k]
         q_for_routing = q_for_routing.permute(0, 2, 1, 3)  # [bs, h, seq_len, d_k]
         q_for_routing = q_for_routing.reshape(bs * seq_len, self.h * self.d_k)
 
         # Use learned routing weights
-        logits = self.wg(q_for_routing)  # [bs*seq_len, n_dynamic_heads]
-        gates = F.softmax(logits, dim=1)  # [bs*seq_len, n_dynamic_heads]
+        logits = self.wg(q_for_routing)  # [bs*seq_len, n_heads]
+        gates = F.softmax(logits, dim=1)  # [bs*seq_len, n_heads]
         
         # Select top-k heads
         _, indices = torch.topk(gates, k=self.h_selected, dim=1)
@@ -315,27 +319,12 @@ class MoHAttention(nn.Module):
         self.head_routing_probs = gates.mean(dim=0)
         self.head_selections = dynamic_mask.sum(dim=0)
         
-        # Handle shared heads routing
-        # All shared heads have equal weight of 1.0
-        self.shared_scores = torch.ones(bs, seq_len, self.h_shared).to(q.device)
-        
-        dynamic_scores_reshaped = self.dynamic_scores.view(bs, seq_len, -1)
-        routing_mask = torch.zeros(bs, seq_len, self.h).to(q.device)
-        routing_mask[:, :, :self.h_shared] = 1.0  # Shared heads always active
-        routing_mask[:, :, self.h_shared:] = dynamic_scores_reshaped  # Add dynamic head weights
-        
-        # Reshape routing mask to match attention dimensions [bs, h, seq_len, 1]
-        # routing_mask = routing_mask.mean(dim=1).unsqueeze(-1).unsqueeze(-1)
-
+        routing_mask = self.dynamic_scores.view(bs, seq_len, -1)
         routing_mask = routing_mask.permute(0, 2, 1).unsqueeze(-1)
         
-        # Calculate attention scores and apply routing
         scores = attention(q, k, v, self.d_k, mask, self.dropout, zero_pad)
-        
-        # Apply routing mask
         output = scores * routing_mask
         
-        # Combine heads
         output = output.transpose(1, 2).contiguous().view(bs, -1, self.d_model)
         
         return self.out(output)

@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # 定义数据集列表
-datasets=("assist2009" "algebra2005" "bridge2algebra2006" "nips_task34" "statics2011" "assist2015" "poj")
+# datasets=("assist2009" "algebra2005" "bridge2algebra2006" "nips_task34" "statics2011" "assist2015" "poj")
+
+datasets=("assist2009")
 
 # 定义基础保存目录
 BASE_SAVE_DIR="/home/wujingchao/pykt-toolkit/examples/saved_model"
